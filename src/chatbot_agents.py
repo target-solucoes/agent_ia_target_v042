@@ -71,12 +71,57 @@ def extract_where_clause_context(sql_query):
                 context[key] = "lista_valores"
         
         # Comparações: coluna > valor, coluna < valor, etc. OU LOWER(coluna) > valor
-        comparisons = re.findall(r"(?:LOWER\()?(\w+)\)?\s*([><=!]+)\s*([^\s'\"]+)", where_clause, re.IGNORECASE)
+        # Regex melhorada para capturar DATE 'valor', 'valor' e "valor"
+        comparisons = re.findall(r"(?:LOWER\()?(\w+)\)?\s*([><=!]+)\s*((?:DATE\s*)?'[^']*'|(?:DATE\s*)?\"[^\"]*\"|[^\s'\"]+)", where_clause, re.IGNORECASE)
         for column, operator, value in comparisons:
             if operator != '=':  # Não sobrescrever igualdades já processadas
                 key = f"{column}_{operator}"
                 if key not in context:
-                    context[key] = value.strip('\'"')
+                    # Limpar o valor capturado
+                    cleaned_value = value.strip()
+                    if cleaned_value.upper().startswith('DATE'):
+                        cleaned_value = cleaned_value[4:].strip()  # Remove 'DATE'
+                    cleaned_value = cleaned_value.strip('\'"')  # Remove aspas
+                    context[key] = cleaned_value
+        
+        # === PROCESSAMENTO ESPECIAL PARA FILTROS DE DATA ===
+        # Detectar ranges de data e formatá-los adequadamente para o contexto
+        if "Data_>=" in context and "Data_<=" in context:
+            try:
+                data_inicio = context["Data_>="]
+                data_fim = context["Data_<="]
+                
+                # Criar um filtro de período mais amigável
+                context["Periodo"] = f"{data_inicio} a {data_fim}"
+                
+                # Manter os filtros originais para compatibilidade interna
+                # mas adicionar versão formatada para exibição
+                
+            except Exception:
+                # Em caso de erro no processamento de datas, manter filtros originais
+                pass
+        elif "Data_>=" in context and "Data_<" in context:
+            try:
+                data_inicio = context["Data_>="]
+                data_fim = context["Data_<"]
+                
+                # Criar um filtro de período mais amigável  
+                context["Periodo"] = f"{data_inicio} a {data_fim}"
+                
+            except Exception:
+                pass
+        elif "Data_>=" in context:
+            try:
+                data_inicio = context["Data_>="]
+                context["Data_Inicio"] = data_inicio
+            except Exception:
+                pass
+        elif "Data_<" in context or "Data_<=" in context:
+            try:
+                data_fim = context.get("Data_<") or context.get("Data_<=")
+                context["Data_Fim"] = data_fim
+            except Exception:
+                pass
         
         return context
     
@@ -352,6 +397,30 @@ Tipos de dados:
             
             # NOVA FUNCIONALIDADE: Memória contextual acumulativa
             self.persistent_context = {}  # Context que persiste entre queries
+            
+            # HIERARQUIA DE COLUNAS: Define níveis hierárquicos para filtros inteligentes
+            # IMPORTANTE: Filtros só se conflitam dentro da MESMA categoria hierárquica
+            self.column_hierarchy = {
+                'cliente': [
+                    'Cod_Cliente',        # Mais específico (cliente individual)
+                    'Cod_Segmento_Cliente'  # Segmento do cliente (mais amplo)
+                ],
+                'regiao': [
+                    'Municipio_Cliente',  # Cidade do cliente (mais específico)
+                    'UF_Cliente'          # Estado do cliente (mais amplo)
+                ],
+                'produto': [
+                    'Cod_Produto',        # Produto específico
+                    'Cod_Familia_Produto', # Família do produto
+                    'Cod_Grupo_Produto',  # Grupo do produto  
+                    'Cod_Linha_Produto',  # Linha do produto
+                    'Des_Linha_Produto'   # Descrição da linha (mais amplo)
+                ],
+                'vendedor': [
+                    'Cod_Vendedor',       # Vendedor específico
+                    'Cod_Regiao_Vendedor' # Região do vendedor (mais amplo)
+                ]
+            }
 
             # Substituir ferramentas por versões otimizadas
             self.python_tool_ref = None  # Referência para o PythonTool otimizado
@@ -373,6 +442,73 @@ Tipos de dados:
                     if var_name in ['Top5_total']:
                         important_vars[var_name] = var_value
                 self.python_tool_ref.variable_cache = important_vars
+
+        def apply_hierarchical_filter_logic(self, new_filters: dict, existing_context: dict) -> dict:
+            """
+            Aplica lógica hierárquica de filtros, substituindo automaticamente filtros
+            de níveis mais específicos quando um filtro mais amplo é aplicado.
+            
+            Args:
+                new_filters: Novos filtros detectados na consulta
+                existing_context: Contexto persistente atual
+                
+            Returns:
+                dict: Contexto atualizado com hierarquia aplicada
+            """
+            updated_context = existing_context.copy()
+            hierarchical_changes = []
+            
+            for new_key, new_value in new_filters.items():
+                # Verificar se o novo filtro está em alguma hierarquia
+                hierarchy_group = None
+                new_level = None
+                
+                for group_name, hierarchy in self.column_hierarchy.items():
+                    if new_key in hierarchy:
+                        hierarchy_group = group_name
+                        new_level = hierarchy.index(new_key)
+                        break
+                
+                if hierarchy_group is not None:
+                    # Encontrar filtros existentes na mesma hierarquia
+                    current_hierarchy = self.column_hierarchy[hierarchy_group]
+                    filters_to_remove = []
+                    
+                    for existing_key in updated_context.keys():
+                        if existing_key in current_hierarchy:
+                            existing_level = current_hierarchy.index(existing_key)
+                            
+                            # Se o novo filtro é mais amplo (nível maior) que o existente
+                            if new_level > existing_level:
+                                filters_to_remove.append(existing_key)
+                                hierarchical_changes.append(
+                                    f"Removido '{existing_key}' (específico) para aplicar '{new_key}' (amplo)"
+                                )
+                            # Se o novo filtro é mais específico, remover o mais amplo
+                            elif new_level < existing_level:
+                                filters_to_remove.append(existing_key)
+                                hierarchical_changes.append(
+                                    f"Removido '{existing_key}' (amplo) para aplicar '{new_key}' (específico)"
+                                )
+                            # Se são do mesmo nível, substituir
+                            elif new_level == existing_level and existing_key != new_key:
+                                filters_to_remove.append(existing_key)
+                                hierarchical_changes.append(
+                                    f"Substituído '{existing_key}' por '{new_key}' (mesmo nível hierárquico)"
+                                )
+                    
+                    # Remover filtros identificados
+                    for key_to_remove in filters_to_remove:
+                        updated_context.pop(key_to_remove, None)
+                
+                # Adicionar o novo filtro
+                updated_context[new_key] = new_value
+            
+            # Log das mudanças hierárquicas se houver debug ativo
+            if hierarchical_changes and hasattr(self, 'debug_info'):
+                self.debug_info.setdefault('hierarchical_changes', []).extend(hierarchical_changes)
+            
+            return updated_context
 
         def detect_top_n_query(self, query: str) -> dict:
             """
@@ -405,10 +541,39 @@ Tipos de dados:
                 'keywords_found': [kw for kw in top_n_keywords if kw in query_lower]
             }
 
-        def process_and_visualize(self, query: str, response_content: str, top_n_info: dict) -> dict:
+        def detect_line_chart_query(self, query: str) -> dict:
+            """
+            Detecta se a consulta é do tipo análise temporal que requer gráfico de linhas.
+            Retorna informações sobre o tipo de visualização necessária.
+            """
+            query_lower = query.lower()
+
+            # Keywords que indicam análise temporal/tendências
+            line_chart_keywords = [
+                'gráfico de linhas', 'grafico de linhas', 'gráfico de linha', 'grafico de linha',
+                'tendência', 'tendencia', 'tendências', 'tendencias',
+                'temporal', 'ao longo do tempo', 'evolução', 'evolucao',
+                'linha do tempo', 'série temporal', 'serie temporal',
+                'progressão', 'progressao', 'histórico', 'historico'
+            ]
+
+            # Detectar presença de keywords de linha/temporal
+            is_line_chart = any(keyword in query_lower for keyword in line_chart_keywords)
+
+            # Verificar se há menção à coluna Data no contexto (será verificado posteriormente)
+            has_date_context = 'data' in query_lower
+
+            return {
+                'is_line_chart': is_line_chart,
+                'has_date_context': has_date_context,
+                'visualization_type': 'line_chart' if is_line_chart else 'table',
+                'keywords_found': [kw for kw in line_chart_keywords if kw in query_lower]
+            }
+
+        def process_and_visualize(self, query: str, response_content: str, top_n_info: dict, line_chart_info: dict = None) -> dict:
             """
             Processa o conteúdo da resposta e gera metadados de visualização
-            para consultas Top N ou dados tabulares normais.
+            para consultas Top N, análise temporal (gráficos de linhas) ou dados tabulares normais.
             Extrai dados reais da resposta em vez de usar dados mockados.
             """
             visualization_data = {
@@ -418,8 +583,13 @@ Tipos de dados:
                 'config': {}
             }
             
-            # Se não é consulta Top N, retornar configuração para tabela
-            if not top_n_info['is_top_n']:
+            # Verificar se é análise temporal (gráfico de linhas) ou Top N (gráfico de barras)
+            line_chart_info = line_chart_info or {}
+            is_line_chart = line_chart_info.get('is_line_chart', False)
+            is_top_n = top_n_info.get('is_top_n', False)
+
+            # Se não é consulta Top N nem análise temporal, retornar configuração para tabela
+            if not is_top_n and not is_line_chart:
                 return visualization_data
             
             # Para consultas Top N, extrair dados reais da resposta
@@ -441,42 +611,77 @@ Tipos de dados:
                 if df is not None and not df.empty and len(df.columns) >= 2:
                     # Converter colunas categóricas que podem estar como numéricas
                     df = self._preprocess_categorical_columns(df)
-                    
-                    # Identificar colunas automaticamente
-                    label_col, value_col = self._identify_chart_columns(df, query)
-                    
-                    # Renomear colunas para padronização
-                    df_chart = df[[label_col, value_col]].copy()
-                    df_chart.columns = ['label', 'value']
-                    
-                    # Garantir que a coluna label seja tratada como string
-                    df_chart['label'] = df_chart['label'].astype(str)
-                    
-                    # Limitar ao top_limit e ordenar
-                    df_limited = df_chart.head(top_n_info['top_limit'])
-                    df_sorted = df_limited.sort_values('value', ascending=False)
-                    
-                    # Gerar título dinâmico baseado na query
-                    chart_title = self._generate_chart_title(query, top_n_info['top_limit'], label_col, value_col)
-                    
-                    # Detectar se a coluna label são IDs categóricos
-                    is_categorical_id = self._is_categorical_id_column(label_col, df_sorted['label'])
-                    
-                    visualization_data = {
-                        'type': 'bar_chart',
-                        'has_data': True,
-                        'data': df_sorted,
-                        'config': {
-                            'orientation': 'horizontal',
-                            'title': chart_title,
-                            'x_column': 'value',
-                            'y_column': 'label',
-                            'max_items': top_n_info['top_limit'],
-                            'value_format': self._detect_value_format(df_sorted['value']),
-                            'is_categorical_id': is_categorical_id,
-                            'original_label_column': label_col
+
+                    # Processar baseado no tipo de visualização
+                    if is_line_chart:
+                        # Para gráficos de linha (análise temporal)
+                        date_col, value_col = self._identify_chart_columns_for_line(df, query)
+
+                        # Verificar se realmente encontrou uma coluna de data
+                        has_valid_date_column = self._has_valid_date_column(df, date_col)
+                        if not has_valid_date_column:
+                            # Se não tem coluna de data válida, voltar para tabela
+                            visualization_data['type'] = 'table'
+                            return visualization_data
+
+                        # Renomear colunas para padronização de gráfico de linha
+                        df_chart = df[[date_col, value_col]].copy()
+                        df_chart.columns = ['date', 'value']
+
+                        # Ordenar por data
+                        df_chart = df_chart.sort_values('date')
+
+                        # Gerar título dinâmico
+                        chart_title = self._generate_line_chart_title(query, date_col, value_col)
+
+                        visualization_data = {
+                            'type': 'line_chart',
+                            'has_data': True,
+                            'data': df_chart,
+                            'config': {
+                                'title': chart_title,
+                                'x_column': 'date',
+                                'y_column': 'value',
+                                'x_label': date_col,
+                                'y_label': value_col
+                            }
                         }
-                    }
+                    else:
+                        # Para gráficos de barra (Top N) - lógica original
+                        label_col, value_col = self._identify_chart_columns(df, query)
+
+                        # Renomear colunas para padronização
+                        df_chart = df[[label_col, value_col]].copy()
+                        df_chart.columns = ['label', 'value']
+
+                        # Garantir que a coluna label seja tratada como string
+                        df_chart['label'] = df_chart['label'].astype(str)
+
+                        # Limitar ao top_limit e ordenar
+                        df_limited = df_chart.head(top_n_info['top_limit'])
+                        df_sorted = df_limited.sort_values('value', ascending=False)
+
+                        # Gerar título dinâmico baseado na query
+                        chart_title = self._generate_chart_title(query, top_n_info['top_limit'], label_col, value_col)
+
+                        # Detectar se a coluna label são IDs categóricos
+                        is_categorical_id = self._is_categorical_id_column(label_col, df_sorted['label'])
+
+                        visualization_data = {
+                            'type': 'bar_chart',
+                            'has_data': True,
+                            'data': df_sorted,
+                            'config': {
+                                'orientation': 'horizontal',
+                                'title': chart_title,
+                                'x_column': 'value',
+                                'y_column': 'label',
+                                'max_items': top_n_info['top_limit'],
+                                'value_format': self._detect_value_format(df_sorted['value'], value_col),
+                                'is_categorical_id': is_categorical_id,
+                                'original_label_column': label_col
+                            }
+                        }
                 else:
                     # Se não conseguiu extrair dados reais, não gerar gráfico
                     visualization_data['type'] = 'table'
@@ -603,7 +808,7 @@ Tipos de dados:
                 # Procurar por colunas de texto para labels (incluindo IDs categóricos)
                 if text_cols:
                     # Procurar por colunas com keywords de entidade
-                    label_keywords = ['uf', 'estado', 'cidade', 'municipio', 'cliente', 'produto', 'linha', 'categoria']
+                    label_keywords = ['uf', 'estado', 'cidade', 'municipio', 'cliente', 'produto', 'linha', 'categoria', 'segmento', 'des_segmento']
                     for col in text_cols:
                         if any(keyword in col.lower() for keyword in label_keywords):
                             label_col = col
@@ -623,6 +828,120 @@ Tipos de dados:
             except:
                 # Fallback absoluto
                 return df.columns[0], df.columns[1] if len(df.columns) > 1 else df.columns[0]
+
+        def _identify_chart_columns_for_line(self, df, query):
+            """Identifica automaticamente as colunas para gráfico de linhas (Data no eixo X, valor no eixo Y)"""
+            try:
+                # Primeiro, tentar identificar colunas de data/datetime
+                date_col = None
+                value_col = None
+
+                # Procurar por colunas com nomes relacionados a data
+                date_keywords = ['data', 'date', 'datetime', 'timestamp', 'time', 'periodo', 'periodo']
+                for col in df.columns:
+                    col_lower = col.lower()
+                    if any(keyword in col_lower for keyword in date_keywords):
+                        date_col = col
+                        break
+
+                # Se não encontrou por nome, procurar por tipo de dados
+                if not date_col:
+                    for col in df.columns:
+                        try:
+                            # Tentar converter uma amostra para datetime
+                            sample_val = df[col].dropna().iloc[0] if not df[col].empty else None
+                            if sample_val is not None:
+                                import pandas as pd
+                                pd.to_datetime(sample_val)
+                                date_col = col
+                                break
+                        except:
+                            continue
+
+                # Identificar colunas numéricas para valores (excluindo a coluna de data)
+                numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+                if date_col in numeric_cols:
+                    numeric_cols.remove(date_col)
+
+                # Procurar por colunas com keywords de valor
+                if numeric_cols:
+                    value_keywords = ['valor', 'vendas', 'receita', 'faturamento', 'total', 'sum', 'count', 'quantidade']
+                    for col in numeric_cols:
+                        if any(keyword in col.lower() for keyword in value_keywords):
+                            value_col = col
+                            break
+
+                    # Se não encontrou por keyword, usar primeira coluna numérica
+                    if not value_col:
+                        value_col = numeric_cols[0]
+
+                # Fallback: usar primeiras colunas disponíveis
+                if not date_col:
+                    date_col = df.columns[0]
+                if not value_col:
+                    value_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+
+                return date_col, value_col
+
+            except:
+                # Fallback absoluto
+                return df.columns[0], df.columns[1] if len(df.columns) > 1 else df.columns[0]
+
+        def _has_valid_date_column(self, df, date_col):
+            """Verifica se a coluna identificada como data realmente contém dados temporais válidos"""
+            try:
+                import pandas as pd
+
+                # Tentar converter uma amostra da coluna para datetime
+                sample_size = min(5, len(df))
+                sample_data = df[date_col].dropna().head(sample_size)
+
+                if sample_data.empty:
+                    return False
+
+                # Tentar converter para datetime
+                pd.to_datetime(sample_data, errors='raise')
+                return True
+
+            except:
+                return False
+
+        def _generate_line_chart_title(self, query, date_col, value_col):
+            """Gera título dinâmico para gráficos de linha baseado na query e colunas identificadas"""
+            try:
+                # Mapear colunas para nomes amigáveis
+                date_mapping = {
+                    'data': 'Data',
+                    'date': 'Data',
+                    'datetime': 'Data',
+                    'timestamp': 'Data',
+                    'periodo': 'Período'
+                }
+
+                value_mapping = {
+                    'valor_vendido': 'Vendas',
+                    'total_vendas': 'Vendas',
+                    'receita': 'Receita',
+                    'faturamento': 'Faturamento',
+                    'quantidade': 'Quantidade',
+                    'valor': 'Valor',
+                    'total': 'Total'
+                }
+
+                # Obter nomes amigáveis
+                date_friendly = date_mapping.get(date_col.lower(), date_col)
+                value_friendly = value_mapping.get(value_col.lower(), value_col)
+
+                # Gerar título baseado na query
+                if 'tendência' in query.lower() or 'tendencia' in query.lower():
+                    return f"Tendência de {value_friendly} ao Longo do Tempo"
+                elif 'evolução' in query.lower() or 'evolucao' in query.lower():
+                    return f"Evolução de {value_friendly}"
+                else:
+                    return f"{value_friendly} por {date_friendly}"
+
+            except:
+                return "Análise Temporal"
 
         def _generate_chart_title(self, query, limit, label_col, value_col):
             """Gera título dinâmico baseado na query e colunas identificadas"""
@@ -655,14 +974,49 @@ Tipos de dados:
             except:
                 return f"Top {limit} Resultados"
 
-        def _detect_value_format(self, values):
-            """Detecta o formato apropriado para os valores (moeda, número, etc.)"""
+        def _detect_value_format(self, values, column_name=None):
+            """Detecta o formato apropriado para os valores baseado no nome da coluna e contexto"""
             try:
-                # Verificar se os valores parecem ser monetários
-                if values.max() > 1000:
+                # Padrões de colunas monetárias comuns
+                monetary_patterns = [
+                    'valor', 'preco', 'price', 'custo', 'cost', 'faturamento', 
+                    'receita', 'revenue', 'vendas', 'sales', 'money', 'cash',
+                    'peso_vendido', 'ticket', 'margem', 'lucro', 'profit',
+                    'valor_vendido', 'vendido'  # Adicionar padrões específicos
+                ]
+                
+                # Padrões de colunas não monetárias
+                non_monetary_patterns = [
+                    'quantidade', 'qtd', 'qty', 'count', 'numero', 'num', 'id',
+                    'codigo', 'cod', 'cliente', 'clientes', 'produto', 'produtos',
+                    'categoria', 'percentual', 'percent', 'taxa', 'rate', 'index',
+                    'score', 'rating', 'ranking', 'posicao', 'position'
+                ]
+                
+                # Se temos o nome da coluna, usar como critério principal
+                if column_name:
+                    column_lower = column_name.lower()
+                    
+                    # Verificar se é explicitamente não monetário (verificação mais específica)
+                    for pattern in non_monetary_patterns:
+                        if pattern in column_lower:
+                            # Mas se também contém padrão monetário, pode ser ambíguo
+                            has_monetary = any(mon_pattern in column_lower for mon_pattern in monetary_patterns)
+                            if not has_monetary:
+                                return 'number'
+                    
+                    # Verificar se é explicitamente monetário
+                    for pattern in monetary_patterns:
+                        if pattern in column_lower:
+                            return 'currency'
+                
+                # Critério de fallback: se não conseguiu determinar pelo nome
+                # e os valores são grandes, pode ser monetário
+                if values.max() > 10000:  # Aumentou o limite para ser mais restritivo
                     return 'currency'
                 else:
                     return 'number'
+                    
             except:
                 return 'number'
 
@@ -771,8 +1125,8 @@ Tipos de dados:
                     explicit_changes[key] = value
             
             # === DETECÇÃO DE ESTADOS/UF ===
-            # Detectar mudanças explícitas de UF/Estado
-            uf_indicators = ['em ', 'no estado de ', 'estado de ', 'na uf ', 'uf ', 'no ', 'na ']
+            # Detectar mudanças explícitas de UF/Estado com melhor cobertura
+            uf_indicators = ['em ', 'no estado de ', 'estado de ', 'na uf ', 'uf ', 'no ', 'na ', 'para ', 'de ']
             uf_mapping = {
                 'sc': 'SC', 'santa catarina': 'SC',
                 'sp': 'SP', 'sao paulo': 'SP', 'são paulo': 'SP',
@@ -781,25 +1135,53 @@ Tipos de dados:
                 'rs': 'RS', 'rio grande do sul': 'RS',
                 'mg': 'MG', 'minas gerais': 'MG',
                 'go': 'GO', 'goias': 'GO', 'goiás': 'GO',
-                'df': 'DF', 'distrito federal': 'DF', 'brasilia': 'DF', 'brasília': 'DF'
+                'df': 'DF', 'distrito federal': 'DF', 'brasilia': 'DF', 'brasília': 'DF',
+                'ba': 'BA', 'bahia': 'BA',
+                'ce': 'CE', 'ceara': 'CE', 'ceará': 'CE',
+                'pe': 'PE', 'pernambuco': 'PE',
+                'am': 'AM', 'amazonas': 'AM',
+                'pa': 'PA', 'para': 'PA', 'pará': 'PA'
             }
             
+            # MELHORIA: Detectar UF mesmo sem indicadores explícitos em casos específicos
+            # Exemplo: "maiores clientes em SP" deve detectar SP como estado
+            state_pattern_detected = False
             for indicator in uf_indicators:
                 if indicator in query_lower:
                     idx = query_lower.find(indicator)
                     remaining_text = query_lower[idx + len(indicator):]
                     words = remaining_text.split()
                     
-                    # Tentar match de UF
+                    # Tentar match de UF (incluindo siglas isoladas)
                     for i in range(min(4, len(words))):
                         for j in range(i+1, min(i+4, len(words)+1)):
                             candidate = ' '.join(words[i:j]).strip(',?.!')
                             if candidate in uf_mapping:
                                 explicit_changes['UF_Cliente'] = uf_mapping[candidate]
+                                state_pattern_detected = True
                                 break
-                        if 'UF_Cliente' in explicit_changes:
+                        if state_pattern_detected:
                             break
-                    break
+                    
+                    # ESPECIAL: Se encontrou "em" seguido de sigla de 2 letras (ex: "em SP")
+                    # e ainda não achou cidade conhecida, assumir que é estado
+                    if not state_pattern_detected and indicator == 'em ' and len(words) > 0:
+                        first_word = words[0].strip(',?.!')
+                        if len(first_word) == 2 and first_word in uf_mapping:
+                            # Verificar se não é uma cidade conhecida
+                            known_cities = {
+                                'joinville': 'Joinville', 'curitiba': 'Curitiba',
+                                'florianopolis': 'Florianópolis', 'florianópolis': 'Florianópolis',
+                                'sao paulo': 'São Paulo', 'são paulo': 'São Paulo',
+                                'rio de janeiro': 'Rio de Janeiro', 'blumenau': 'Blumenau',
+                                'itajai': 'Itajaí', 'itajaí': 'Itajaí'
+                            }
+                            if first_word not in known_cities:
+                                explicit_changes['UF_Cliente'] = uf_mapping[first_word]
+                                state_pattern_detected = True
+                    
+                    if state_pattern_detected:
+                        break
             
             # === DETECÇÃO DE PRODUTOS/SEGMENTOS ===
             # Detectar mudanças explícitas em produtos ou segmentos
@@ -826,6 +1208,69 @@ Tipos de dados:
                 for key in temporal_keys:
                     if key in explicit_changes:
                         del explicit_changes[key]
+            
+            # === DETECÇÃO DE CÓDIGOS ESPECÍFICOS ===
+            # Detectar códigos de clientes explicitamente mencionados
+            cliente_patterns = [
+                r'\bcliente\s+(\d+)',           # "cliente 14159"
+                r'\bcódigo\s+(\d+)',            # "código 14159"  
+                r'\bcod\s+(\d+)',               # "cod 14159"
+                r'\bpelo\s+cliente\s+(\d+)',    # "pelo cliente 14159"
+                r'\bdo\s+cliente\s+(\d+)',      # "do cliente 14159"
+                r'\bno\s+cliente\s+(\d+)',      # "no cliente 14159"
+                r'\bid\s+(\d+)',                # "id 14159"
+            ]
+            
+            for pattern in cliente_patterns:
+                matches = re.findall(pattern, query_lower)
+                if matches:
+                    # Pegar o primeiro código encontrado
+                    codigo_cliente = matches[0]
+                    explicit_changes['Cod_Cliente'] = int(codigo_cliente)
+                    break
+            
+            # === DETECÇÃO DE CÓDIGOS DE VENDEDORES ===
+            vendedor_patterns = [
+                r'\bvendedor\s+(\d+)',          # "vendedor 123"
+                r'\bcód\.\s*vendedor\s+(\d+)',  # "cód. vendedor 123"
+                r'\bdo\s+vendedor\s+(\d+)',     # "do vendedor 123"
+                r'\bpelo\s+vendedor\s+(\d+)',   # "pelo vendedor 123"
+                r'\brepresentante\s+(\d+)',     # "representante 123"
+            ]
+            
+            for pattern in vendedor_patterns:
+                matches = re.findall(pattern, query_lower)
+                if matches:
+                    codigo_vendedor = matches[0]
+                    explicit_changes['Cod_Vendedor'] = int(codigo_vendedor)
+                    break
+                    
+            # === DETECÇÃO DE CÓDIGOS DE PRODUTOS ===
+            produto_patterns = [
+                r'\bproduto\s+(\d+)',           # "produto 456"
+                r'\bcód\.\s*produto\s+(\d+)',   # "cód. produto 456"  
+                r'\bdo\s+produto\s+(\d+)',      # "do produto 456"
+                r'\bitem\s+(\d+)',              # "item 456"
+                r'\bfamília\s+(\d+)',           # "família 789"
+                r'\bgrupo\s+(\d+)',             # "grupo 789"
+                r'\blinha\s+(\d+)',             # "linha 789"
+            ]
+            
+            for pattern in produto_patterns:
+                matches = re.findall(pattern, query_lower)
+                if matches:
+                    codigo_produto = matches[0]
+                    # Determinar qual tipo de código baseado no padrão
+                    if 'família' in pattern:
+                        explicit_changes['Cod_Familia_Produto'] = int(codigo_produto)
+                    elif 'grupo' in pattern:
+                        explicit_changes['Cod_Grupo_Produto'] = int(codigo_produto)
+                    elif 'linha' in pattern:
+                        explicit_changes['Cod_Linha_Produto'] = int(codigo_produto)
+                    else:
+                        # Default para código geral de produto
+                        explicit_changes['Cod_Produto'] = int(codigo_produto)
+                    break
             
             # === DETECÇÃO DE NEGAÇÃO/LIMPEZA ===
             # Detectar quando usuário quer limpar filtros específicos
@@ -1163,7 +1608,7 @@ Tipos de dados:
             
             return filter_adjustments
         
-        def inject_context_into_query(self, user_query: str, explicit_changes: dict, comparative_info: dict = None) -> str:
+        def inject_context_into_query(self, user_query: str, explicit_changes: dict, comparative_info: dict = None, disabled_filters: set = None) -> str:
             """
             Injeta contexto com suporte especializado para consultas comparativas autônomas.
             
@@ -1171,6 +1616,7 @@ Tipos de dados:
                 user_query: Query original do usuário
                 explicit_changes: Mudanças explícitas detectadas na query
                 comparative_info: Informações sobre natureza comparativa (opcional)
+                disabled_filters: Conjunto de filtros desabilitados pelo usuário (opcional)
                 
             Returns:
                 str: Query modificada com contexto e instruções comparativas
@@ -1178,6 +1624,27 @@ Tipos de dados:
             # === PROCESSAMENTO DE CONTEXTO ===
             # Mesclar contexto atual com mudanças explícitas
             active_context = self.persistent_context.copy()
+            
+            # Aplicar filtros desabilitados removendo-os do contexto ativo
+            if disabled_filters:
+                # Converter filtros desabilitados para remoção do contexto
+                disabled_keys = set()
+                for filter_id in disabled_filters:
+                    if ':' in filter_id:
+                        key, value = filter_id.split(':', 1)
+                        # Tratar casos especiais como range de datas
+                        if key == "Data_range":
+                            # Para ranges, desabilitar ambos Data_>= e Data_<
+                            disabled_keys.add("Data_>=")
+                            disabled_keys.add("Data_<")
+                        else:
+                            # Verificar se o valor corresponde e remover
+                            if key in active_context and str(active_context[key]) == value:
+                                disabled_keys.add(key)
+                
+                # Remover filtros desabilitados do contexto ativo
+                for key in disabled_keys:
+                    active_context.pop(key, None)
             
             # Processar mudanças explícitas, incluindo limpeza de filtros
             for key, value in explicit_changes.items():
@@ -1497,7 +1964,7 @@ Tipos de dados:
             
             return should_substitute, substitution_summary
 
-        def merge_contexts(self, new_context: dict, explicit_changes: dict, comparative_info: dict = None) -> dict:
+        def merge_contexts(self, new_context: dict, explicit_changes: dict, comparative_info: dict = None, disabled_filters: set = None) -> dict:
             """
             Mescla contextos com lógica inteligente de priorização e suporte para consultas comparativas.
             
@@ -1511,24 +1978,82 @@ Tipos de dados:
             """
             # === INICIALIZAÇÃO ===
             merged_context = self.persistent_context.copy()
+            current_timestamp = pd.Timestamp.now()
+            
+            # Inicializar sistema de timestamps para rastreamento de filtros
+            if not hasattr(self, '_filter_timestamps'):
+                self._filter_timestamps = {}
+            
             context_metadata = {
-                'merge_timestamp': pd.Timestamp.now().isoformat(),
+                'merge_timestamp': current_timestamp.isoformat(),
                 'merge_operations': [],
                 'conflicts_resolved': [],
-                'context_age': {}
+                'context_age': {},
+                'filter_priorities': {}
             }
             
-            # === PROCESSAMENTO DE MUDANÇAS EXPLÍCITAS (ALTA PRIORIDADE) ===
+            # === PROCESSAMENTO DE MUDANÇAS EXPLÍCITAS COM HIERARQUIA (ALTA PRIORIDADE) ===
             for key, value in explicit_changes.items():
                 if value == '__CLEAR__':
                     # Remover completamente do contexto
                     if key in merged_context:
                         old_value = merged_context.pop(key)
+                        # Remover timestamp também
+                        self._filter_timestamps.pop(key, None)
                         context_metadata['merge_operations'].append(f"CLEARED: {key} (era: {old_value})")
                 else:
-                    # Aplicar mudança e registrar operação
+                    # APLICAR LÓGICA HIERÁRQUICA ANTES DE ADICIONAR O FILTRO
+                    # Verificar se o novo filtro está em alguma hierarquia
+                    hierarchy_group = None
+                    new_level = None
+                    
+                    for group_name, hierarchy in self.column_hierarchy.items():
+                        if key in hierarchy:
+                            hierarchy_group = group_name
+                            new_level = hierarchy.index(key)
+                            break
+                    
+                    # Se está em uma hierarquia, aplicar lógica hierárquica
+                    if hierarchy_group is not None:
+                        current_hierarchy = self.column_hierarchy[hierarchy_group]
+                        filters_to_remove = []
+                        
+                        for existing_key in list(merged_context.keys()):
+                            if existing_key in current_hierarchy:
+                                existing_level = current_hierarchy.index(existing_key)
+                                
+                                # Se o novo filtro é mais amplo (nível maior) que o existente
+                                if new_level > existing_level:
+                                    filters_to_remove.append(existing_key)
+                                    context_metadata['merge_operations'].append(
+                                        f"HIERARCHY: Removido '{existing_key}' (específico) para aplicar '{key}' (amplo)"
+                                    )
+                                # Se o novo filtro é mais específico, remover o mais amplo  
+                                elif new_level < existing_level:
+                                    filters_to_remove.append(existing_key)
+                                    context_metadata['merge_operations'].append(
+                                        f"HIERARCHY: Removido '{existing_key}' (amplo) para aplicar '{key}' (específico)"
+                                    )
+                                # Se são do mesmo nível, substituir
+                                elif new_level == existing_level and existing_key != key:
+                                    filters_to_remove.append(existing_key)
+                                    context_metadata['merge_operations'].append(
+                                        f"HIERARCHY: Substituído '{existing_key}' por '{key}' (mesmo nível)"
+                                    )
+                        
+                        # Remover filtros identificados ANTES de adicionar o novo
+                        for key_to_remove in filters_to_remove:
+                            merged_context.pop(key_to_remove, None)
+                            self._filter_timestamps.pop(key_to_remove, None)
+                            context_metadata['merge_operations'].append(f"REMOVED: {key_to_remove} devido à hierarquia")
+                    
+                    # Aplicar mudança e registrar operação com timestamp
                     old_value = merged_context.get(key, "N/A")
                     merged_context[key] = value
+                    
+                    # Registrar timestamp da mudança explícita (máxima prioridade)
+                    self._filter_timestamps[key] = current_timestamp
+                    context_metadata['filter_priorities'][key] = 'EXPLICIT'
                     context_metadata['merge_operations'].append(f"EXPLICIT: {key} {old_value} → {value}")
             
             # === PROCESSAMENTO ESPECIAL PARA CONSULTAS COMPARATIVAS ===
@@ -1594,43 +2119,76 @@ Tipos de dados:
                     continue
                     
                 if key not in merged_context:
-                    # Novo campo - adicionar
+                    # Novo campo - adicionar com timestamp
                     merged_context[key] = value
+                    self._filter_timestamps[key] = current_timestamp
+                    context_metadata['filter_priorities'][key] = 'NEW'
                     context_metadata['merge_operations'].append(f"ADDED: {key} = {value}")
                 else:
-                    # Campo existe - decidir se atualizar
+                    # Campo existe - decidir se atualizar baseado em prioridade temporal
                     old_value = merged_context[key]
                     
-                    # === HEURÍSTICAS DE SUBSTITUIÇÃO ===
+                    # === HEURÍSTICAS DE SUBSTITUIÇÃO COM PRIORIDADE TEMPORAL ===
                     should_replace = False
+                    replacement_reason = ""
+                    
+                    # PRIORIDADE MÁXIMA: Verificar se o filtro existente é muito antigo
+                    filter_age_minutes = 0
+                    if key in self._filter_timestamps:
+                        filter_age = current_timestamp - self._filter_timestamps[key]
+                        filter_age_minutes = filter_age.total_seconds() / 60
+                        
+                        # Se o filtro existente é muito antigo (>30 min), substituir
+                        if filter_age_minutes > 30:
+                            should_replace = True
+                            replacement_reason = f"filtro muito antigo ({filter_age_minutes:.1f} min)"
                     
                     # Heurística 1: Valor novo é mais específico (mais longo)
-                    if isinstance(value, str) and isinstance(old_value, str):
+                    if not should_replace and isinstance(value, str) and isinstance(old_value, str):
                         if len(value.strip()) > len(old_value.strip()):
                             should_replace = True
-                            context_metadata['merge_operations'].append(f"REPLACED (mais específico): {key} {old_value} → {value}")
+                            replacement_reason = "mais específico"
                     
                     # Heurística 2: Valor novo parece mais recente (contém ano maior)
-                    import re
-                    old_years = re.findall(r'\d{4}', str(old_value))
-                    new_years = re.findall(r'\d{4}', str(value))
-                    
-                    if old_years and new_years:
-                        max_old_year = max(int(y) for y in old_years)
-                        max_new_year = max(int(y) for y in new_years)
+                    if not should_replace:
+                        import re
+                        old_years = re.findall(r'\d{4}', str(old_value))
+                        new_years = re.findall(r'\d{4}', str(value))
                         
-                        if max_new_year > max_old_year:
-                            should_replace = True  
-                            context_metadata['merge_operations'].append(f"REPLACED (mais recente): {key} {old_value} → {value}")
+                        if old_years and new_years:
+                            max_old_year = max(int(y) for y in old_years)
+                            max_new_year = max(int(y) for y in new_years)
+                            
+                            if max_new_year > max_old_year:
+                                should_replace = True  
+                                replacement_reason = "ano mais recente"
                     
                     # Heurística 3: Valor antigo é genérico demais
-                    generic_values = ['DATE', 'N/A', 'undefined', 'null', '']
-                    if str(old_value) in generic_values and str(value) not in generic_values:
-                        should_replace = True
-                        context_metadata['merge_operations'].append(f"REPLACED (específico vs genérico): {key} {old_value} → {value}")
+                    if not should_replace:
+                        generic_values = ['DATE', 'N/A', 'undefined', 'null', '']
+                        if str(old_value) in generic_values and str(value) not in generic_values:
+                            should_replace = True
+                            replacement_reason = "específico vs genérico"
+                    
+                    # Heurística 4: NOVA - Prioridade geográfica baseada em especificidade
+                    if not should_replace and key in ['Municipio_Cliente', 'UF_Cliente']:
+                        # Para campos geográficos, aplicar lógica de priorização temporal mais agressiva
+                        if key in self._filter_timestamps:
+                            # Se filtro geográfico tem mais de 10 minutos, considerar substituição
+                            if filter_age_minutes > 10:
+                                should_replace = True
+                                replacement_reason = f"filtro geográfico antigo ({filter_age_minutes:.1f} min)"
                     
                     if should_replace:
                         merged_context[key] = value
+                        self._filter_timestamps[key] = current_timestamp
+                        context_metadata['filter_priorities'][key] = 'UPDATED'
+                        context_metadata['merge_operations'].append(f"REPLACED ({replacement_reason}): {key} {old_value} → {value}")
+                    else:
+                        # Manter valor existente mas atualizar metadados
+                        context_metadata['filter_priorities'][key] = 'PRESERVED'
+                        age_info = f" (idade: {filter_age_minutes:.1f} min)" if filter_age_minutes > 0 else ""
+                        context_metadata['merge_operations'].append(f"PRESERVED: {key} = {old_value}{age_info}")
             
             # === LIMPEZA E OTIMIZAÇÃO ===
             # Remover campos com valores inválidos
@@ -1673,18 +2231,87 @@ Tipos de dados:
                 municipio_uf_map = {
                     'joinville': 'sc', 'curitiba': 'pr', 'porto alegre': 'rs',
                     'sao paulo': 'sp', 'são paulo': 'sp', 'rio de janeiro': 'rj',
-                    'florianopolis': 'sc', 'florianópolis': 'sc'
+                    'florianopolis': 'sc', 'florianópolis': 'sc', 'blumenau': 'sc',
+                    'itajai': 'sc', 'itajaí': 'sc', 'santos': 'sp', 'campinas': 'sp',
+                    'sorocaba': 'sp', 'londrina': 'pr', 'maringa': 'pr', 'maringá': 'pr',
+                    'cascavel': 'pr', 'foz do iguacu': 'pr', 'foz do iguaçu': 'pr',
+                    'belo horizonte': 'mg', 'salvador': 'ba', 'fortaleza': 'ce',
+                    'recife': 'pe', 'manaus': 'am', 'belem': 'pa', 'belém': 'pa',
+                    'goiania': 'go', 'goiânia': 'go', 'brasilia': 'df', 'brasília': 'df'
                 }
                 
+                # CONFLITO TIPO 1: Município e UF incompatíveis
                 if municipio in municipio_uf_map:
                     expected_uf = municipio_uf_map[municipio]
                     if uf and uf != expected_uf:
-                        # Conflito detectado - priorizar município (mais específico)
-                        merged_context.pop('UF_Cliente', None)
-                        context_metadata['conflicts_resolved'].append(f"Conflito geo: removido UF {uf} (inconsistente com município {municipio})")
+                        # Conflito detectado - priorizar mudança explícita mais recente
+                        if 'UF_Cliente' in explicit_changes and 'Municipio_Cliente' not in explicit_changes:
+                            # UF foi mudado explicitamente, remover município conflitante
+                            merged_context.pop('Municipio_Cliente', None)
+                            context_metadata['conflicts_resolved'].append(f"Conflito geo: removido município {municipio} (incompatível com nova UF {uf})")
+                        elif 'Municipio_Cliente' in explicit_changes and 'UF_Cliente' not in explicit_changes:
+                            # Município foi mudado explicitamente, remover UF conflitante
+                            merged_context.pop('UF_Cliente', None)
+                            context_metadata['conflicts_resolved'].append(f"Conflito geo: removido UF {uf} (incompatível com novo município {municipio})")
+                        else:
+                            # Ambos ou nenhum foram mudados explicitamente - priorizar município (mais específico)
+                            merged_context.pop('UF_Cliente', None)
+                            context_metadata['conflicts_resolved'].append(f"Conflito geo: removido UF {uf} (inconsistente com município {municipio})")
             
+            # === RESOLUÇÃO DE CONFLITOS GEOGRÁFICOS AVANÇADA ===
+            # Detectar conflitos entre mudanças explícitas e contexto persistente
+            for geo_field in ['Municipio_Cliente', 'UF_Cliente']:
+                if geo_field in explicit_changes:
+                    new_value = explicit_changes[geo_field].lower()
+                    
+                    # Se uma nova localização foi especificada explicitamente, 
+                    # remover localizações conflitantes do contexto anterior
+                    if geo_field == 'UF_Cliente' and 'Municipio_Cliente' in merged_context:
+                        # Nova UF especificada - verificar se município existente é compatível
+                        existing_municipio = merged_context.get('Municipio_Cliente', '').lower()
+                        if existing_municipio in municipio_uf_map:
+                            expected_uf_for_municipio = municipio_uf_map[existing_municipio]
+                            if new_value != expected_uf_for_municipio:
+                                # Município existente é incompatível com nova UF
+                                merged_context.pop('Municipio_Cliente', None)
+                                context_metadata['conflicts_resolved'].append(f"Nova UF {new_value}: removido município incompatível {existing_municipio}")
+                    
+                    elif geo_field == 'Municipio_Cliente' and 'UF_Cliente' in merged_context:
+                        # Novo município especificado - verificar se UF existente é compatível
+                        existing_uf = merged_context.get('UF_Cliente', '').lower()
+                        if new_value in municipio_uf_map:
+                            expected_uf_for_new_municipio = municipio_uf_map[new_value]
+                            if existing_uf != expected_uf_for_new_municipio:
+                                # UF existente é incompatível com novo município
+                                merged_context.pop('UF_Cliente', None)
+                                context_metadata['conflicts_resolved'].append(f"Novo município {new_value}: removido UF incompatível {existing_uf}")
+            
+            # === APLICAÇÃO DE FILTROS DESABILITADOS ===
+            # Aplicar filtros desabilitados removendo-os do merged_context antes de persistir
+            if disabled_filters:
+                # Converter filtros desabilitados para remoção do contexto
+                disabled_keys = set()
+                for filter_id in disabled_filters:
+                    if ':' in filter_id:
+                        key, value = filter_id.split(':', 1)
+                        # Tratar casos especiais como range de datas
+                        if key == "Data_range":
+                            # Para ranges, desabilitar ambos Data_>= e Data_<
+                            disabled_keys.add("Data_>=")
+                            disabled_keys.add("Data_<")
+                        else:
+                            # Verificar se o valor corresponde e remover
+                            if key in merged_context and str(merged_context[key]) == value:
+                                disabled_keys.add(key)
+                
+                # Remover filtros desabilitados do contexto a ser persistido
+                for key in disabled_keys:
+                    if key in merged_context:
+                        removed_value = merged_context.pop(key)
+                        context_metadata['merge_operations'].append(f"DISABLED_FILTER_REMOVED: {key} = {removed_value}")
+
             # === ATUALIZAÇÃO DO CONTEXTO PERSISTENTE ===
-            # Atualizar contexto persistente para próximas queries
+            # Atualizar contexto persistente para próximas queries (já sem os filtros desabilitados)
             self.persistent_context = merged_context.copy()
             
             # Adicionar metadados apenas em modo debug
@@ -1693,13 +2320,16 @@ Tipos de dados:
             
             return merged_context
 
-        def run(self, query: str, debug_mode=False, **kwargs):
+        def run(self, query: str, debug_mode=False, disabled_filters=None, **kwargs):
             # === FASE 1: DETECÇÃO DE CONSULTAS COMPARATIVAS ===
             comparative_info = self.detect_comparative_query(query)
             
             # === FASE 1.5: DETECÇÃO DE CONSULTAS TOP N ===
             top_n_info = self.detect_top_n_query(query)
-            
+
+            # === FASE 1.6: DETECÇÃO DE CONSULTAS DE ANÁLISE TEMPORAL ===
+            line_chart_info = self.detect_line_chart_query(query)
+
             # === FASE 2: DETECÇÃO DE MUDANÇAS CONTEXTUAIS ===
             explicit_changes = self.detect_explicit_context_changes(query)
             
@@ -1721,7 +2351,8 @@ Tipos de dados:
                 self.persistent_context = {}
                 self.clear_execution_state()
             
-            # === FASE 6: APLICAÇÃO DO CONTEXTO COMPARATIVO ===
+            # === FASE 6: APLICAÇÃO DA HIERARQUIA E CONTEXTO COMPARATIVO ===
+            # CORREÇÃO: Aplicar hierarquia ANTES de injetar contexto
             # Para consultas comparativas, priorizar sistema de expansão
             if comparative_info['is_comparative']:
                 context_to_apply = explicit_changes  # Já inclui filtros expandidos
@@ -1730,8 +2361,11 @@ Tipos de dados:
             else:
                 context_to_apply = explicit_changes if explicit_changes else {}
             
-            # SISTEMA COMPARATIVO: Injeção de contexto com suporte a comparações
-            enhanced_query = self.inject_context_into_query(query, context_to_apply, comparative_info)
+            # APLICAR HIERARQUIA: Mesclar contextos com lógica hierárquica ANTES da injeção
+            hierarchical_context = self.merge_contexts({}, context_to_apply, comparative_info, disabled_filters)
+            
+            # SISTEMA COMPARATIVO: Injeção de contexto com hierarquia já aplicada
+            enhanced_query = self.inject_context_into_query(query, hierarchical_context, comparative_info, disabled_filters)
             
             # === FASE 7: INICIALIZAÇÃO DE DEBUG COMPARATIVO ===
             self.debug_info = {
@@ -1813,8 +2447,8 @@ Tipos de dados:
             response = super().run(processed_query, **kwargs)
             
             # === FASE 5.5: PROCESSAMENTO DE VISUALIZAÇÃO ===
-            # Processar dados de visualização baseado na detecção Top N
-            visualization_data = self.process_and_visualize(query, response.content, top_n_info)
+            # Processar dados de visualização baseado na detecção Top N e análise temporal
+            visualization_data = self.process_and_visualize(query, response.content, top_n_info, line_chart_info)
             
             # === FASE 6: PROCESSAMENTO CONTEXTUAL FINAL ===
             # Coletar todos os contextos das queries executadas
@@ -1826,8 +2460,19 @@ Tipos de dados:
                 if isinstance(ctx, dict):
                     current_context.update(ctx)
             
-            # SISTEMA COMPARATIVO: Mesclar contextos com suporte comparativo
-            final_context = self.merge_contexts(current_context, context_to_apply, comparative_info)
+            # SISTEMA COMPARATIVO: Usar contexto já processado com hierarquia
+            # Mesclar com contextos de query SQL para debug
+            final_context = hierarchical_context.copy()
+            final_context.update(current_context)
+            
+            # === INTEGRAÇÃO AUTOMÁTICA DE FILTROS DA WHERE CLAUSE ===
+            # Integrar automaticamente os filtros extraídos das queries SQL ao contexto persistente
+            # Isso permite que filtros como período/data sejam capturados automaticamente
+            if current_context:
+                # Atualizar o persistent_context com os novos filtros descobertos
+                for key, value in current_context.items():
+                    if key not in self.persistent_context or str(self.persistent_context.get(key)) != str(value):
+                        self.persistent_context[key] = value
             
             # Atualizar debug info com informações contextuais finais
             self.debug_info["query_contexts"] = [final_context] if final_context else [{}]
@@ -1836,8 +2481,11 @@ Tipos de dados:
             
             # === ADICIONAR INFORMAÇÕES DE VISUALIZAÇÃO AO DEBUG INFO ===
             self.debug_info["top_n_info"] = top_n_info
+            self.debug_info["line_chart_info"] = line_chart_info
             self.debug_info["visualization_data"] = visualization_data
-            self.debug_info["should_visualize"] = visualization_data.get('type') == 'bar_chart' and visualization_data.get('has_data', False)
+            should_visualize_chart = (visualization_data.get('type') in ['bar_chart', 'line_chart']
+                                     and visualization_data.get('has_data', False))
+            self.debug_info["should_visualize"] = should_visualize_chart
             
             # Garantir que sempre temos pelo menos um contexto
             if not self.debug_info.get("query_contexts"):
