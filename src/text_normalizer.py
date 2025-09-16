@@ -213,10 +213,11 @@ class TextNormalizer:
         
         temporal_entities = {}
         
-        # Padrão principal: "mês de ano" ou "mês ano"
+        # Padrão principal: "mês de ano" ou "mês ano" ou "mês/ano"
         month_year_patterns = [
             r'\b(\w+)\s+de\s+(\d{4})\b',  # "julho de 2015"
             r'\b(\w+)\s+(\d{4})\b',       # "julho 2015"
+            r'\b(\w+)/(\d{4})\b',         # "julho/2015"
             r'\bem\s+(\w+)\s+de\s+(\d{4})\b',  # "em julho de 2015"
             r'\bno\s+(\w+)\s+de\s+(\d{4})\b',  # "no julho de 2015"
             r'\bdurante\s+(\w+)\s+de\s+(\d{4})\b',  # "durante julho de 2015"
@@ -259,14 +260,29 @@ class TextNormalizer:
                     }
                     break  # Usar apenas a primeira ocorrência válida
         
-        # Padrão para períodos entre meses: "entre junho e julho de 2015"
-        between_pattern = r'\bentre\s+(\w+)\s+e\s+(\w+)\s+de\s+(\d{4})\b'
-        between_match = re.search(between_pattern, text_lower)
+        # Padrão para períodos entre meses: "entre junho e julho de 2015" ou "entre junho/2015 e julho/2015"
+        between_patterns = [
+            r'\bentre\s+(\w+)\s+e\s+(\w+)\s+de\s+(\d{4})\b',  # "entre junho e julho de 2015"
+            r'\bentre\s+(\w+)/(\d{4})\s+e\s+(\w+)/(\d{4})\b',  # "entre junho/2015 e julho/2015"
+        ]
+        
+        between_match = None
+        for between_pattern in between_patterns:
+            between_match = re.search(between_pattern, text_lower)
+            if between_match:
+                break
         
         if between_match and not temporal_entities:
-            start_month_text = between_match.group(1).strip()
-            end_month_text = between_match.group(2).strip()
-            year_text = between_match.group(3).strip()
+            # Handle different patterns with different group structures
+            if 'de' in between_match.group(0):  # "entre junho e julho de 2015"
+                start_month_text = between_match.group(1).strip()
+                end_month_text = between_match.group(2).strip()
+                year_text = between_match.group(3).strip()
+            else:  # "entre junho/2015 e julho/2015"
+                start_month_text = between_match.group(1).strip()
+                year_text = between_match.group(2).strip()
+                end_month_text = between_match.group(3).strip()
+                # For slash format, both should have same year, so use first year
             
             if start_month_text in month_mapping and end_month_text in month_mapping:
                 start_month_num = month_mapping[start_month_text]
@@ -297,11 +313,13 @@ class TextNormalizer:
                     'parsed_year': year_text
                 }
         
-        # Padrão para anos individuais: "em 2015", "no ano de 2015"
+        # Padrão para anos individuais: "em 2015", "no ano de 2015", "no período de 2015"
         year_patterns = [
             r'\bem\s+(\d{4})\b',
             r'\bno\s+ano\s+de\s+(\d{4})\b',
             r'\bdurante\s+(\d{4})\b',
+            r'\bno\s+per[ií]odo\s+de\s+(\d{4})\b',
+            r'\bper[ií]odo\s+de\s+(\d{4})\b',
         ]
         
         if not temporal_entities:  # Só aplicar se não encontrou padrão mês/ano
