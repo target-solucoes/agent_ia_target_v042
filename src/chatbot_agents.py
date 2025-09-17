@@ -570,11 +570,154 @@ Tipos de dados:
                 'keywords_found': [kw for kw in line_chart_keywords if kw in query_lower]
             }
 
+        def detect_query_complexity(self, query: str, response_content: str = "") -> dict:
+            """
+            Detecta automaticamente a complexidade de uma query para determinar se deve usar visualização
+            gráfica ou tabular. Queries complexas retornam dados tabulares para maior precisão.
+
+            Critérios de complexidade:
+            - Múltiplas agregações ou métricas derivadas
+            - Comparações temporais (variação, crescimento)
+            - Múltiplas dimensões (top N dentro de top N)
+            - Análises que requerem múltiplos GROUP BY ou JOINs
+            - Cálculos percentuais ou variações
+
+            Returns:
+                dict: {
+                    'is_complex': bool,
+                    'complexity_score': int (0-100),
+                    'complexity_reasons': list,
+                    'force_tabular': bool
+                }
+            """
+            query_lower = query.lower()
+            complexity_score = 0
+            complexity_reasons = []
+
+            # 1. Padrões de comparação temporal (alta complexidade)
+            temporal_comparison_patterns = [
+                r'\bvariação\b.*\bentre\b',  # "variação entre maio e junho"
+                r'\bentre\b.*\be\b.*\b(mês|mes|ano|período|periodo)',  # "entre maio e junho"
+                r'\bcomparar\b.*\bcom\b',  # "comparar X com Y"
+                r'\bversus\b|\bvs\b',  # "vendas versus ano anterior"
+                r'\bcrescimento\b.*\b(percentual|%)',  # "crescimento percentual"
+                r'\bvariou\b|\bvariaram\b',  # "que mais variaram"
+                r'\bdiferença\b.*\bentre\b',  # "diferença entre períodos"
+                r'\bevolução\b.*\b(temporal|mensal|anual)',  # "evolução temporal"
+            ]
+
+            for pattern in temporal_comparison_patterns:
+                if re.search(pattern, query_lower):
+                    complexity_score += 25
+                    complexity_reasons.append(f"Padrão de comparação temporal detectado: {pattern}")
+
+            # 2. Múltiplas dimensões aninhadas (alta complexidade)
+            nested_dimension_patterns = [
+                r'\btop\s*\d+.*\b(no|nos|dentro|em|dos)\b.*\btop\s*\d+',  # "top 3 produtos nos top 5 clientes"
+                r'\bmaiores\b.*\b(no|nos|dentro|em|dos)\b.*\bmaiores\b',  # "maiores vendas nos maiores clientes"
+                r'\bmelhores\b.*\b(no|nos|dentro|em|dos)\b.*\bmelhores\b',  # "melhores produtos nos melhores segmentos"
+                r'\bprincipais\b.*\b(no|nos|dentro|em|dos)\b.*\bprincipais\b',  # estruturas aninhadas
+                r'\d+.*\bque\s+mais\b.*\bnos?\b.*\d+.*\bmaiores\b',  # "3 produtos que mais venderam nos 5 maiores"
+                r'\d+.*\bque\s+mais\b.*\bnos?\b.*\bmaiores\b',  # "produtos que mais venderam nos maiores"
+                r'\bmais\s+(venderam|lucraram|faturaram).*\bnos?\b.*\bmaiores\b',  # "mais venderam nos maiores"
+            ]
+
+            for pattern in nested_dimension_patterns:
+                if re.search(pattern, query_lower):
+                    complexity_score += 30
+                    complexity_reasons.append(f"Estrutura aninhada detectada: {pattern}")
+
+            # 3. Múltiplas métricas ou agregações
+            aggregation_keywords = [
+                'soma', 'total', 'média', 'average', 'count', 'máximo', 'mínimo',
+                'percentual', '%', 'proporção', 'participação', 'share'
+            ]
+
+            found_aggregations = [kw for kw in aggregation_keywords if kw in query_lower]
+            if len(found_aggregations) >= 2:
+                complexity_score += 20
+                complexity_reasons.append(f"Múltiplas agregações detectadas: {found_aggregations}")
+
+            # 4. Palavras-chave que indicam análise complexa
+            complex_analysis_keywords = [
+                'análise', 'analise', 'detalhamento', 'breakdown', 'composição',
+                'distribuição', 'segmentação', 'estratificação', 'decomposição',
+                'cresceram', 'crescimento', 'crescer', 'percentualmente', 'detalhada'
+            ]
+
+            found_complex_keywords = [kw for kw in complex_analysis_keywords if kw in query_lower]
+            if found_complex_keywords:
+                # Aumentar score para análise complexa com crescimento/percentual
+                is_growth_analysis = any(kw in ['cresceram', 'crescimento', 'crescer', 'percentualmente'] for kw in found_complex_keywords)
+                score_boost = 20 if is_growth_analysis else 15
+                complexity_score += score_boost
+                complexity_reasons.append(f"Análise complexa detectada: {found_complex_keywords}")
+
+            # 5. Múltiplas condições temporais
+            time_condition_patterns = [
+                r'\b(janeiro|fevereiro|março|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\b',
+                r'\b\d{4}\b',  # anos
+                r'\b(trimestre|semestre|bimestre)\b',
+                r'\b(último|anterior|passado|atual)\b.*\b(mês|mes|ano|período|periodo)\b'
+            ]
+
+            time_matches = []
+            for pattern in time_condition_patterns:
+                matches = re.findall(pattern, query_lower)
+                time_matches.extend(matches)
+
+            if len(time_matches) >= 2:
+                complexity_score += 15
+                complexity_reasons.append(f"Múltiplas condições temporais: {time_matches}")
+
+            # 6. Análise de SQL patterns no response_content (se disponível)
+            if response_content:
+                sql_complexity_patterns = [
+                    r'GROUP BY.*GROUP BY',  # múltiplos GROUP BY
+                    r'JOIN.*JOIN.*JOIN',  # múltiplos JOINs
+                    r'UNION|INTERSECT|EXCEPT',  # operações de conjunto
+                    r'WITH.*AS\s*\(',  # CTEs (Common Table Expressions)
+                    r'CASE\s+WHEN.*CASE\s+WHEN',  # múltiplos CASE WHEN
+                    r'HAVING.*AND.*HAVING',  # múltiplas condições HAVING
+                ]
+
+                for pattern in sql_complexity_patterns:
+                    if re.search(pattern, response_content, re.IGNORECASE):
+                        complexity_score += 10
+                        complexity_reasons.append(f"Padrão SQL complexo detectado: {pattern}")
+
+            # 7. Verificar se contém solicitação explícita de formato
+            explicit_table_requests = [
+                'formato de tabela', 'em tabela', 'como tabela', 'formato tabular',
+                'exibir tabela', 'mostrar tabela', 'listar em tabela', 'apresentar tabela'
+            ]
+
+            has_explicit_table_request = any(request in query_lower for request in explicit_table_requests)
+
+            # Determinar se é complexo e se deve forçar formato tabular
+            # Threshold mais baixo para capturar mais análises complexas
+            is_complex = complexity_score >= 20
+            force_tabular = is_complex or has_explicit_table_request
+
+            # Adicionar razão para solicitação explícita
+            if has_explicit_table_request:
+                complexity_reasons.append("Solicitação explícita de formato tabular detectada")
+
+            return {
+                'is_complex': is_complex,
+                'complexity_score': complexity_score,
+                'complexity_reasons': complexity_reasons,
+                'force_tabular': force_tabular,
+                'has_explicit_request': has_explicit_table_request
+            }
+
         def process_and_visualize(self, query: str, response_content: str, top_n_info: dict, line_chart_info: dict = None) -> dict:
             """
             Processa o conteúdo da resposta e gera metadados de visualização
             para consultas Top N, análise temporal (gráficos de linhas) ou dados tabulares normais.
             Extrai dados reais da resposta em vez de usar dados mockados.
+
+            Nova lógica inclui detecção automática de complexidade para evitar gráficos incorretos.
             """
             visualization_data = {
                 'type': 'table',  # Default
@@ -582,8 +725,18 @@ Tipos de dados:
                 'data': None,
                 'config': {}
             }
-            
-            # Verificar se é análise temporal (gráfico de linhas) ou Top N (gráfico de barras)
+
+            # NOVA LÓGICA: Detectar complexidade da query primeiro
+            complexity_info = self.detect_query_complexity(query, response_content)
+
+            # PRIORIDADE 1: Se query é complexa ou tem solicitação explícita, forçar tabela
+            if complexity_info.get('force_tabular', False):
+                # Adicionar informações de debug sobre complexidade
+                visualization_data['complexity_info'] = complexity_info
+                visualization_data['force_tabular_reason'] = complexity_info.get('complexity_reasons', [])
+                return visualization_data
+
+            # PRIORIDADE 2: Verificar se é análise temporal (gráfico de linhas) ou Top N (gráfico de barras)
             line_chart_info = line_chart_info or {}
             is_line_chart = line_chart_info.get('is_line_chart', False)
             is_top_n = top_n_info.get('is_top_n', False)
