@@ -4,7 +4,7 @@ Um chatbot inteligente para análise de dados comerciais utilizando a plataforma
 
 ## 📋 Descrição
 
-O Target AI Agent Agno é uma solução completa de inteligência artificial para análise de dados comerciais. O sistema combina as capacidades avançadas do framework Agno com DuckDB e OpenAI GPT-4, oferecendo uma interface conversacional intuitiva onde usuários podem fazer perguntas em linguagem natural sobre dados comerciais e obter insights precisos e fundamentados.
+O Target AI Agent Agno é uma solução completa de inteligência artificial para análise de dados comerciais. O sistema combina as capacidades avançadas do framework Agno com DuckDB e OpenAI GPT-5, oferecendo uma interface conversacional intuitiva onde usuários podem fazer perguntas em linguagem natural sobre dados comerciais e obter insights precisos e fundamentados.
 
 ## ✨ Principais Características
 
