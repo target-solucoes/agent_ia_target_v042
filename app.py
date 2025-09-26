@@ -1,5 +1,5 @@
 """
-Aplicação Streamlit Refatorada - Target AI Agent v0.5
+Aplicação Streamlit Refatorada - Target AI Agent v0.51
 Reduzido de 1468 para aproximadamente 300 linhas
 """
 
@@ -23,7 +23,7 @@ from src.filters.json_filter_manager import get_json_filter_manager
 from src.visualization.plotly_charts import render_plotly_visualization
 
 # Page configuration
-st.set_page_config(page_title="Agente IA Target v0.5", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="Agente IA Target v0.51", page_icon="🤖", layout="wide")
 
 
 def main():
@@ -527,7 +527,7 @@ def _render_header():
     st.markdown(
         f"""
         <div class="header-container">
-            <h1 class="app-title">🤖 AGENTE IA TARGET v0.5</h1>
+            <h1 class="app-title">🤖 AGENTE IA TARGET v0.51</h1>
             <p class="app-subtitle">INTELIGÊNCIA ARTIFICIAL PARA ANÁLISE DE DADOS</p>
             <p class="app-description">
                 Converse naturalmente com seus dados comerciais. Faça perguntas em linguagem natural
